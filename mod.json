@@ -1,0 +1,79 @@
+{
+    "geode": "6.0.0",
+    "gd": {
+        "win": "2.2091"
+    },
+    "id": "julgaga.startpos-anywhere",
+    "name": "Start Pos Anywhere",
+    "version": "v1.0.0",
+    "developer": "julgaga",
+    "description": "Start a level from any percentage, with start positions created from your own runs.",
+    "tags": ["gameplay", "utility"],
+    "links": {
+        "source": "https://github.com/julgaga/startpos-anywhere"
+    },
+    "settings": {
+        "respawn-title": {
+            "type": "title",
+            "name": "Respawn"
+        },
+        "respawn-margin": {
+            "type": "int",
+            "name": "Respawn safety margin",
+            "description": "In blocks. \"Respawn\" and the % slider stop this far before the furthest point you reached, which is usually where you died.",
+            "default": 10,
+            "min": 0,
+            "max": 60
+        },
+        "manual-title": {
+            "type": "title",
+            "name": "Manual start positions"
+        },
+        "place-startpos": {
+            "type": "keybind",
+            "name": "Place a start pos",
+            "description": "Places a start position where you are, without stopping the run.",
+            "default": "C",
+            "category": "gameplay"
+        },
+        "next-startpos": {
+            "type": "keybind",
+            "name": "Next start pos",
+            "description": "Restarts from the next manual start position.",
+            "default": "E",
+            "category": "gameplay"
+        },
+        "prev-startpos": {
+            "type": "keybind",
+            "name": "Previous start pos",
+            "description": "Restarts from the previous manual start position (or the level start).",
+            "default": "Q",
+            "category": "gameplay"
+        },
+        "delete-startpos": {
+            "type": "keybind",
+            "name": "Delete start pos",
+            "description": "Deletes the active manual start position.",
+            "default": "Shift+C",
+            "category": "gameplay"
+        },
+        "manual-min-gap": {
+            "type": "int",
+            "name": "Minimum gap between start pos",
+            "description": "In blocks. A new manual start position closer than this to another one is ignored. 0 = no limit.",
+            "default": 3,
+            "min": 0,
+            "max": 30
+        },
+        "debug-title": {
+            "type": "title",
+            "name": "Debug"
+        },
+        "debug-logs": {
+            "type": "bool",
+            "name": "Verbose logs",
+            "description": "Writes the recording state to the Geode console every second. Only useful for debugging.",
+            "default": false
+        }
+    }
+}
