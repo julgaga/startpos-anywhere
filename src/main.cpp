@@ -4,6 +4,8 @@
 
 #include "Snapshot.hpp"
 #include "SpawnPopup.hpp"
+#include "MenuPopup.hpp"
+#include <Geode/ui/GeodeUI.hpp>
 #include "Storage.hpp"
 
 using namespace geode::prelude;
@@ -25,6 +27,20 @@ static bool debugLogs() {
     return Mod::get()->getSettingValue<bool>("debug-logs");
 }
 
+// v1.1 : le « mode précis ». En practice, GD sait capturer l'état complet du
+// niveau (triggers, blocs déplacés, couleurs, groupes...) dans un CheckpointObject.
+static bool preciseEnabled() {
+    return Mod::get()->getSettingValue<bool>("precise-mode");
+}
+static int preciseIntervalBuckets() {
+    return std::max<int>(1, static_cast<int>(Mod::get()->getSettingValue<int64_t>("precise-interval")));
+}
+
+struct PreciseCheckpoint {
+    Ref<CheckpointObject> checkpoint;
+    float percent = 0.f;
+};
+
 class $modify(SPAPlayLayer, PlayLayer) {
     struct Fields {
         std::map<int, Snapshot> snaps; // clé = tranche de x
@@ -38,6 +54,12 @@ class $modify(SPAPlayLayer, PlayLayer) {
 
         std::vector<Snapshot> manual;      // v0.6 : start pos posées à la main, triées par x
         int manualIndex = -1;              // celle qui est active (-1 = aucune)
+
+        // v1.1 : checkpoints complets pris automatiquement en practice.
+        std::map<int, PreciseCheckpoint> precise; // clé = tranche de x (multiple de l'intervalle)
+        int lastPreciseKey = -1;
+        Ref<CheckpointObject> preciseActive;      // celui d'où on respawn (nullptr = aucun)
+        unsigned int preciseBaseline = 0;         // nb de checkpoints du joueur au moment du spawn
     };
 
     bool init(GJGameLevel* level, bool dontCreateObjects) {
@@ -80,6 +102,7 @@ class $modify(SPAPlayLayer, PlayLayer) {
         int bucket = static_cast<int>(m_player1->getPositionX() / BUCKET_SIZE);
         auto& snap = m_fields->snaps[bucket];
         snap = takeSnapshot(this, m_player1);
+        this->recordPrecise(bucket, snap.percent);
 
         // Un résumé par seconde dans la console pour vérifier.
         m_fields->logTimer += dt;
@@ -99,8 +122,54 @@ class $modify(SPAPlayLayer, PlayLayer) {
         );
     }
 
+    // v1.1 : en practice, un vrai checkpoint tous les N blocs.
+    void recordPrecise(int bucket, float percent) {
+        // GD efface ses checkpoints en quittant la practice : on fait pareil.
+        if (!m_isPracticeMode) {
+            if (!m_fields->precise.empty() || m_fields->preciseActive) this->clearPrecise();
+            return;
+        }
+        // Un run parti d'une start pos a déjà un état de triggers faux :
+        // ses checkpoints ne seraient pas « précis », on n'en prend pas.
+        if (m_isTestMode || !preciseEnabled()) return;
+
+        int interval = preciseIntervalBuckets();
+        int key = bucket - bucket % interval;
+        if (key == m_fields->lastPreciseKey) return;
+        m_fields->lastPreciseKey = key;
+
+        if (auto cp = this->createCheckpoint()) {
+            m_fields->precise[key] = PreciseCheckpoint{cp, percent};
+        }
+    }
+
+    void clearPrecise() {
+        m_fields->precise.clear();
+        m_fields->preciseActive = nullptr;
+        m_fields->lastPreciseKey = -1;
+    }
+
     void resetLevel() {
+        // v1.1 : même méthode que Practice Checkpoint Permanence. En practice,
+        // GD recharge le dernier checkpoint de m_checkpointArray : on y glisse
+        // le nôtre juste le temps du reset, puis on le retire.
+        CheckpointObject* injected = nullptr;
+        if (m_fields->preciseActive && m_isPracticeMode && m_checkpointArray) {
+            unsigned int count = m_checkpointArray->count();
+            if (count < m_fields->preciseBaseline) m_fields->preciseBaseline = count; // tu en as supprimé
+            if (count > m_fields->preciseBaseline) {
+                // Tu as posé ton propre checkpoint depuis : c'est lui qui compte.
+                m_fields->preciseActive = nullptr;
+            }
+            else {
+                injected = m_fields->preciseActive;
+                m_checkpointArray->addObject(injected);
+            }
+        }
+
         PlayLayer::resetLevel();
+
+        if (injected) m_checkpointArray->removeObject(injected);
         this->applySpawnHeight();
         if (debugLogs()) {
             log::info("Reset : {} snapshots en memoire", m_fields->snaps.size());
@@ -171,6 +240,7 @@ class $modify(SPAPlayLayer, PlayLayer) {
         m_fields->customStart = obj;
         m_fields->lastSpawnPercent = s.percent;
         m_fields->activeSpawn = s;
+        m_fields->preciseActive = nullptr;
 
         log::info(
             "Spawn a {:.1f}% ({} {}) | y joueur = {:.1f} | centre couloir = {:.1f}",
@@ -202,7 +272,47 @@ class $modify(SPAPlayLayer, PlayLayer) {
         return s ? s->percent : -1.f;
     }
 
+    // v1.1 : le checkpoint précis le plus loin dont le % est <= pct, sans
+    // dépasser la marge de sécurité. nullptr hors practice ou si aucun.
+    PreciseCheckpoint const* preciseForPercent(float pct) {
+        if (!m_isPracticeMode || !preciseEnabled() || m_fields->precise.empty()) return nullptr;
+        auto& snaps = m_fields->snaps;
+        int maxBucket = snaps.empty()
+            ? std::numeric_limits<int>::max()
+            : snaps.rbegin()->first - respawnMarginBuckets();
+        PreciseCheckpoint const* best = nullptr;
+        for (auto const& [key, p] : m_fields->precise) {
+            if (key > maxBucket || p.percent > pct) break;
+            best = &p;
+        }
+        return best;
+    }
+
+    // Respawn depuis un checkpoint complet : l'état du niveau est exact.
+    void spawnPrecise(CheckpointObject* cp, float percent) {
+        // Notre start pos fausserait le run (et couperait l'enregistrement) :
+        // on remet celle d'origine, sans relancer, le reset vient juste après.
+        if (m_fields->hasOriginal && m_startPosObject == static_cast<StartPosObject*>(m_fields->customStart)) {
+            this->setActiveStartPosObject(m_fields->originalStart);
+        }
+        m_fields->activeSpawn.reset();
+        m_fields->manualIndex = -1;
+        m_fields->lastSpawnPercent = percent;
+        m_fields->preciseActive = cp;
+        m_fields->preciseBaseline = m_checkpointArray ? m_checkpointArray->count() : 0;
+
+        log::info("Spawn precis a {:.1f}% (checkpoint complet)", percent);
+        this->resetLevel();
+        this->startMusic();
+    }
+
     void spawnAtPercent(float pct) {
+        // En practice, un checkpoint précis passe avant la start pos.
+        if (auto p = this->preciseForPercent(pct)) {
+            m_fields->manualIndex = -1;
+            this->spawnPrecise(p->checkpoint, p->percent);
+            return;
+        }
         auto s = this->snapshotForPercent(pct);
         if (!s) {
             Notification::create("Aucun snapshot enregistre", NotificationIcon::Warning)->show();
@@ -222,12 +332,14 @@ class $modify(SPAPlayLayer, PlayLayer) {
     // Revient à la start pos d'origine (le début du niveau, en général).
     void spawnAtOriginalStart() {
         if (!m_fields->hasOriginal) {
+            m_fields->preciseActive = nullptr;
             this->resetLevel();
             return;
         }
         log::info("Retour au debut du niveau");
         m_fields->activeSpawn.reset();
         m_fields->manualIndex = -1;
+        m_fields->preciseActive = nullptr;
         this->switchToStartPosObject(m_fields->originalStart);
     }
 
@@ -354,122 +466,151 @@ $on_mod(Loaded) {
     listenForKeybindSettingPresses("delete-startpos", onPress([](SPAPlayLayer* pl) { pl->deleteManual(); }));
 }
 
+// --- Le menu pause ----------------------------------------------------------
+
+static SPAPlayLayer* getPlayLayer() {
+    return static_cast<SPAPlayLayer*>(PlayLayer::get());
+}
+
+// Ferme le menu pause (s'il est encore là) pour reprendre la partie.
+// On le cherche dans la scène : nos popups peuvent avoir été ouverts par-dessus.
+static void resumeGame() {
+    auto scene = CCDirector::get()->getRunningScene();
+    if (auto pause = scene ? scene->getChildByType<PauseLayer>(0) : nullptr) {
+        pause->onResume(nullptr);
+    }
+}
+
+static void openPercentPopup() {
+    auto pl = getPlayLayer();
+    if (!pl) return;
+
+    float maxPct = pl->safeMaxPercent();
+    if (maxPct < 0.f) {
+        Notification::create("Joue un peu d'abord : rien n'est enregistre", NotificationIcon::Warning)->show();
+        return;
+    }
+    float initial = pl->m_fields->lastSpawnPercent >= 0.f ? pl->m_fields->lastSpawnPercent : maxPct;
+
+    auto describe = [](float pct) -> std::string {
+        auto pl = getPlayLayer();
+        if (auto p = pl ? pl->preciseForPercent(pct) : nullptr) {
+            return fmt::format("-> {:.1f} % : checkpoint precis", p->percent);
+        }
+        auto s = pl ? pl->snapshotForPercent(pct) : nullptr;
+        if (!s) return "";
+        return fmt::format(
+            "-> {:.1f} % : {} {}{}{}",
+            s->percent, gamemodeName(s->gamemode), speedName(s->speed),
+            s->mini ? " mini" : "", s->dual ? " dual" : ""
+        );
+    };
+    auto spawn = [](float pct) {
+        resumeGame();
+        if (auto pl = getPlayLayer()) pl->spawnAtPercent(pct);
+    };
+
+    if (auto popup = SpawnPopup::create(maxPct, initial, describe, spawn)) {
+        popup->show();
+    }
+}
+
+static void confirmDeleteAllManual() {
+    auto pl = getPlayLayer();
+    if (!pl) return;
+    auto count = pl->m_fields->manual.size();
+    if (count == 0) {
+        Notification::create("Aucune start pos manuelle sur ce niveau", NotificationIcon::Info)->show();
+        return;
+    }
+    createQuickPopup(
+        "Tout supprimer",
+        fmt::format("Supprimer les <cy>{}</c> start pos manuelles de ce niveau ?", count),
+        "Annuler", "Supprimer",
+        [](FLAlertLayer*, bool confirmed) {
+            if (!confirmed) return;
+            if (auto pl = getPlayLayer()) {
+                int n = pl->deleteAllManual();
+                Notification::create(fmt::format("{} start pos supprimees", n), NotificationIcon::Success)->show();
+            }
+        }
+    );
+}
+
+static void openModMenu() {
+    auto pl = getPlayLayer();
+    if (!pl) return;
+
+    float maxPct = pl->safeMaxPercent();
+    std::string status = maxPct < 0.f
+        ? "Rien d'enregistre pour l'instant"
+        : fmt::format("Enregistre jusqu'a {:.1f} %", maxPct);
+    status += fmt::format("\n{} start pos manuelle(s)", pl->m_fields->manual.size());
+    if (pl->m_isPracticeMode && preciseEnabled()) {
+        status += fmt::format(" - {} checkpoint(s) precis", pl->m_fields->precise.size());
+    }
+
+    MenuActions actions;
+    actions.respawn = [] {
+        resumeGame();
+        if (auto pl = getPlayLayer()) pl->spawnNearFurthest();
+    };
+    actions.choosePercent = [] { openPercentPopup(); };
+    actions.backToStart = [] {
+        resumeGame();
+        if (auto pl = getPlayLayer()) pl->spawnAtOriginalStart();
+    };
+    actions.deleteManual = [] { confirmDeleteAllManual(); };
+
+    // Choisir une start pos manuelle : « 2/5 - 37.5 % - ship (active) ».
+    auto& manual = pl->m_fields->manual;
+    for (std::size_t i = 0; i < manual.size(); ++i) {
+        actions.manualLabels.push_back(fmt::format(
+            "{}/{} - {:.1f} % - {}{}",
+            i + 1, manual.size(), manual[i].percent, gamemodeName(manual[i].gamemode),
+            static_cast<int>(i) == pl->m_fields->manualIndex ? " (active)" : ""
+        ));
+    }
+    actions.manualSelected = std::max(0, pl->m_fields->manualIndex);
+    actions.goToManual = [](int index) {
+        resumeGame();
+        if (auto pl = getPlayLayer()) pl->goToManual(index);
+    };
+
+    if (auto popup = MenuPopup::create(status, std::move(actions))) {
+        popup->show();
+    }
+}
+
 class $modify(SPAPauseLayer, PauseLayer) {
+    // Une seule petite icône (le logo du mod) qui ouvre le menu du mod.
     void customSetup() {
         PauseLayer::customSetup();
 
         auto pl = PlayLayer::get();
         if (!pl || pl->m_isPlatformer) return;
 
-        auto winSize = CCDirector::get()->getWinSize();
+        auto logo = geode::createModLogo(Mod::get());
+        limitNodeSize(logo, {30.f, 30.f}, 1.f, .01f);
+        auto btn = CCMenuItemSpriteExtra::create(logo, this, menu_selector(SPAPauseLayer::onOpenMenu));
+        btn->setID("menu-button"_spr);
+
+        // Avec le mod node-ids, le menu pause a un menu vertical à gauche
+        // (celui des icônes des autres mods) : on s'y range.
+        if (auto left = this->getChildByID("left-button-menu")) {
+            left->addChild(btn);
+            left->updateLayout();
+            return;
+        }
+        // Sinon : dans le coin en bas à gauche, à l'écart du reste.
         auto menu = CCMenu::create();
-        menu->setID("startpos-anywhere-menu"_spr);
-        menu->setPosition({0.f, 0.f});
+        menu->setID("menu"_spr);
+        menu->setPosition({28.f, 28.f});
+        menu->addChild(btn);
         this->addChild(menu);
-
-        auto spawnBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Respawn", "goldFont.fnt", "GJ_button_01.png", .7f),
-            this, menu_selector(SPAPauseLayer::onSpawnFurthest)
-        );
-        spawnBtn->setPosition({70.f, winSize.height / 2.f + 40.f});
-        menu->addChild(spawnBtn);
-
-        auto percentBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Choisir %", "goldFont.fnt", "GJ_button_02.png", .7f),
-            this, menu_selector(SPAPauseLayer::onChoosePercent)
-        );
-        percentBtn->setPosition({70.f, winSize.height / 2.f});
-        menu->addChild(percentBtn);
-
-        auto startBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Debut", "goldFont.fnt", "GJ_button_04.png", .7f),
-            this, menu_selector(SPAPauseLayer::onSpawnStart)
-        );
-        startBtn->setPosition({70.f, winSize.height / 2.f - 40.f});
-        menu->addChild(startBtn);
-
-        auto clearBtn = CCMenuItemSpriteExtra::create(
-            ButtonSprite::create("Suppr. SP", "goldFont.fnt", "GJ_button_06.png", .7f),
-            this, menu_selector(SPAPauseLayer::onDeleteAllManual)
-        );
-        clearBtn->setPosition({70.f, winSize.height / 2.f - 80.f});
-        menu->addChild(clearBtn);
     }
 
-    void onDeleteAllManual(CCObject*) {
-        auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get());
-        if (!pl) return;
-        auto count = pl->m_fields->manual.size();
-        if (count == 0) {
-            Notification::create("Aucune start pos manuelle sur ce niveau", NotificationIcon::Info)->show();
-            return;
-        }
-        createQuickPopup(
-            "Tout supprimer",
-            fmt::format("Supprimer les <cy>{}</c> start pos manuelles de ce niveau ?", count),
-            "Annuler", "Supprimer",
-            [](FLAlertLayer*, bool confirmed) {
-                if (!confirmed) return;
-                if (auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get())) {
-                    int n = pl->deleteAllManual();
-                    Notification::create(
-                        fmt::format("{} start pos supprimees", n), NotificationIcon::Success
-                    )->show();
-                }
-            }
-        );
-    }
-
-    void onChoosePercent(CCObject*) {
-        auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get());
-        if (!pl) return;
-
-        float maxPct = pl->safeMaxPercent();
-        if (maxPct < 0.f) {
-            Notification::create("Joue un peu d'abord : rien n'est enregistre", NotificationIcon::Warning)->show();
-            return;
-        }
-        float initial = pl->m_fields->lastSpawnPercent >= 0.f ? pl->m_fields->lastSpawnPercent : maxPct;
-
-        auto describe = [](float pct) -> std::string {
-            auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get());
-            auto s = pl ? pl->snapshotForPercent(pct) : nullptr;
-            if (!s) return "";
-            return fmt::format(
-                "-> {:.1f} % : {} {}{}{}",
-                s->percent, gamemodeName(s->gamemode), speedName(s->speed),
-                s->mini ? " mini" : "", s->dual ? " dual" : ""
-            );
-        };
-
-        // Le menu pause peut avoir changé pendant que le popup était ouvert :
-        // on le retrouve dans la scène au moment du spawn.
-        auto spawn = [](float pct) {
-            auto scene = CCDirector::get()->getRunningScene();
-            if (auto pause = scene ? scene->getChildByType<PauseLayer>(0) : nullptr) {
-                pause->onResume(nullptr);
-            }
-            if (auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get())) {
-                pl->spawnAtPercent(pct);
-            }
-        };
-
-        if (auto popup = SpawnPopup::create(maxPct, initial, describe, spawn)) {
-            popup->show();
-        }
-    }
-
-    // onResume retire le menu pause : on récupère le PlayLayer avant,
-    // et on ne touche plus à `this` après.
-    void onSpawnFurthest(CCObject*) {
-        auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get());
-        this->onResume(nullptr);
-        if (pl) pl->spawnNearFurthest();
-    }
-
-    void onSpawnStart(CCObject*) {
-        auto pl = static_cast<SPAPlayLayer*>(PlayLayer::get());
-        this->onResume(nullptr);
-        if (pl) pl->spawnAtOriginalStart();
+    void onOpenMenu(CCObject*) {
+        openModMenu();
     }
 };

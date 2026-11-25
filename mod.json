@@ -5,7 +5,7 @@
     },
     "id": "julgaga.startpos-anywhere",
     "name": "Start Pos Anywhere",
-    "version": "v1.0.0",
+    "version": "v1.1.0",
     "developer": "julgaga",
     "description": "Start a level from any percentage, with start positions created from your own runs.",
     "tags": ["gameplay", "utility"],
@@ -23,6 +23,24 @@
             "description": "In blocks. \"Respawn\" and the % slider stop this far before the furthest point you reached, which is usually where you died.",
             "default": 10,
             "min": 0,
+            "max": 60
+        },
+        "precise-title": {
+            "type": "title",
+            "name": "Precise mode (practice)"
+        },
+        "precise-mode": {
+            "type": "bool",
+            "name": "Precise mode",
+            "description": "In practice mode, also records full checkpoints (triggers, moved blocks, colors, groups) and respawns from them. Only runs started from the real level start are recorded. Not saved between sessions.",
+            "default": true
+        },
+        "precise-interval": {
+            "type": "int",
+            "name": "Precise checkpoint interval",
+            "description": "In blocks. Lower is closer to the % you pick, but uses more memory.",
+            "default": 10,
+            "min": 2,
             "max": 60
         },
         "manual-title": {
